@@ -26,17 +26,61 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => {
-  res.json({
-    name: 'Video Compression Service (Server B)',
-    version: '1.0.0',
-    status: 'running',
-    endpoints: {
-      health: '/health',
-      admin: '/admin',
-      api: '/api',
-      storage: '/storage/hls'
-    }
-  });
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Video Compression Service - Server B</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; background: #f5f5f5; }
+        .container { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        h1 { color: #333; margin-bottom: 10px; }
+        .status { color: #10b981; font-weight: bold; font-size: 18px; margin-bottom: 30px; }
+        .links { display: grid; gap: 15px; }
+        .link-card { background: #f9fafb; padding: 20px; border-radius: 8px; border-left: 4px solid #667eea; }
+        .link-card h3 { margin: 0 0 10px 0; color: #333; }
+        .link-card p { margin: 0 0 10px 0; color: #666; font-size: 14px; }
+        .link-card a { color: #667eea; text-decoration: none; font-weight: 500; }
+        .link-card a:hover { text-decoration: underline; }
+        .info { background: #eff6ff; border-left: 4px solid #3b82f6; padding: 15px; border-radius: 8px; margin-top: 30px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>🎬 Video Compression Service</h1>
+        <div class="status">✅ Server B is Running</div>
+        
+        <div class="links">
+          <div class="link-card">
+            <h3>📊 Admin Dashboard</h3>
+            <p>Monitor compression queue and job status in real-time</p>
+            <a href="/admin">Open Dashboard →</a>
+          </div>
+          
+          <div class="link-card">
+            <h3>💚 Health Check</h3>
+            <p>View system status and Appwrite connection</p>
+            <a href="/health">Check Health →</a>
+          </div>
+          
+          <div class="link-card">
+            <h3>📚 API Documentation</h3>
+            <p>Complete API reference for developers</p>
+            <a href="https://github.com" target="_blank">View Docs →</a>
+          </div>
+        </div>
+        
+        <div class="info">
+          <strong>How it works:</strong><br>
+          1. WordPress uploads video data to Appwrite<br>
+          2. Server B downloads and compresses videos into HLS format<br>
+          3. Compressed files are stored and URLs sent back to Appwrite<br>
+          4. WordPress displays the adaptive streaming video player
+        </div>
+      </div>
+    </body>
+    </html>
+  `);
 });
 
 app.use('/health', healthRouter);
