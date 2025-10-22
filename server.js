@@ -51,9 +51,39 @@ if (process.env.ADMIN_ENABLED === 'true') {
 app.use(notFoundHandler);
 app.use(errorHandler);
 
+function validateEnvironment() {
+  const required = [
+    'APPWRITE_ENDPOINT',
+    'APPWRITE_PROJECT_ID',
+    'APPWRITE_API_KEY',
+    'DATABASE_ID',
+    'COLLECTION_ID'
+  ];
+  
+  const missing = required.filter(key => !process.env[key]);
+  
+  if (missing.length > 0) {
+    logger.error(`Missing required environment variables: ${missing.join(', ')}`);
+    logger.error('Please configure these in your .env file or Replit Secrets');
+    return false;
+  }
+  
+  if (!process.env.API_KEY || process.env.API_KEY === 'change-this-secret-key') {
+    logger.warn('API_KEY is not configured or using default value');
+    logger.warn('API endpoints will not be properly secured');
+  }
+  
+  return true;
+}
+
 async function startServer() {
   try {
     logger.info('Starting Video Compression Service...');
+    
+    if (!validateEnvironment()) {
+      logger.error('Environment validation failed. Server cannot start.');
+      process.exit(1);
+    }
     
     const appwriteResult = initializeAppwrite();
     logger.info('Appwrite client initialized');
