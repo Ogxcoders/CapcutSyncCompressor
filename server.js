@@ -88,8 +88,12 @@ app.use('/api', apiLimiter, apiRouter);
 app.use('/storage/hls', storageRouter);
 
 if (process.env.ADMIN_ENABLED === 'true') {
-  app.use(process.env.ADMIN_PATH || '/admin', express.static(path.join(__dirname, 'public')));
-  logger.info('Admin dashboard enabled at /admin');
+  const adminPath = process.env.ADMIN_PATH || '/admin';
+  app.use(adminPath, express.static(path.join(__dirname, 'public')));
+  app.get(adminPath, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+  });
+  logger.info(`Admin dashboard enabled at ${adminPath}`);
 }
 
 app.use(notFoundHandler);
