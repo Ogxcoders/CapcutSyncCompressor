@@ -1,0 +1,19 @@
+node_modules/
+.env
+storage/temp/*
+storage/hls/*
+logs/*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Keep directory structure
+!storage/temp/.gitkeep
+!storage/hls/.gitkeep
+!logs/.gitkeep
