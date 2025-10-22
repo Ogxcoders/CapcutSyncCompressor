@@ -1,0 +1,979 @@
+# 📋 COMPLETE COMPRESSION SITE PLAN (Server B)
+*No code - just pure architecture and flow*
+
+---
+
+## 🎯 SITE OVERVIEW
+
+**Name:** Video Compression Service  
+**Purpose:** Background worker that processes videos + Serves compressed files  
+**Core Job:** Monitor Appwrite → Download → Compress → Store → Update  
+**Technology Stack:** Node.js + Express + FFmpeg + Appwrite SDK  
+**Deployment:** VPS/Dedicated server (needs FFmpeg + storage)
+
+---
+
+## 📦 PROJECT STRUCTURE
+
+```
+server-b/
+│
+├── .env                           → Environment configuration
+├── .env.example                   → Template for setup
+├── package.json                   → Dependencies
+├── package-lock.json              → Lock file
+│
+├── server.js                      → Main entry point (starts everything)
+│
+├── config/
+│   └── appwrite.js                → Appwrite connection config
+│
+├── services/
+│   ├── worker.js                  → Main worker loop
+│   ├── downloader.js              → Download original videos
+│   ├── compressor.js              → FFmpeg compression logic
+│   ├── storage.js                 → File system operations
+│   └── appwrite-sync.js           → Update Appwrite documents
+│
+├── utils/
+│   ├── logger.js                  → Logging system (file + console)
+│   ├── ffmpeg-helper.js           → FFmpeg command builders
+│   ├── file-validator.js          → Check video formats
+│   └── cleanup.js                 → Delete temp files
+│
+├── routes/
+│   ├── api.js                     → REST API endpoints
+│   ├── health.js                  → Health check endpoint
+│   └── storage.js                 → Serve static HLS files
+│
+├── middleware/
+│   ├── auth.js                    → API key validation
+│   ├── rate-limit.js              → Rate limiting
+│   └── error-handler.js           → Global error handling
+│
+├── public/
+│   ├── admin.html                 → Dashboard UI
+│   ├── css/
+│   │   └── admin.css              → Dashboard styles
+│   └── js/
+│       └── admin.js               → Dashboard logic (Appwrite SDK)
+│
+├── storage/
+│   ├── temp/                      → Temporary downloads
+│   │   └── [auto-cleaned]
+│   │
+│   └── hls/                       → Final HLS output
+│       └── {wp_post_id}/          → One folder per video
+│           ├── poster.jpg
+│           ├── master.m3u8
+│           ├── high/
+│           │   ├── playlist.m3u8
+│           │   └── segment000.ts, segment001.ts...
+│           ├── medium/
+│           │   ├── playlist.m3u8
+│           │   └── segment000.ts...
+│           └── low/
+│               ├── playlist.m3u8
+│               └── segment000.ts...
+│
+├── logs/
+│   ├── worker.log                 → Worker activity
+│   ├── compression.log            → FFmpeg output
+│   ├── error.log                  → Errors only
+│   └── access.log                 → API requests
+│
+└── scripts/
+    ├── install.sh                 → Setup script (install FFmpeg, create dirs)
+    ├── start.sh                   → Start with PM2
+    └── cleanup-old.sh             → Delete videos older than X days
+```
+
+---
+
+## ⚙️ ENVIRONMENT CONFIGURATION (.env)
+
+```
+# Appwrite Connection
+APPWRITE_ENDPOINT=https://appwrite.yourserver.com/v1
+APPWRITE_PROJECT_ID=your-project-id
+APPWRITE_API_KEY=your-serverb-api-key
+DATABASE_ID=video_compression
+COLLECTION_ID=posts
+
+# Server Settings
+PORT=3000
+NODE_ENV=production
+PUBLIC_URL=https://serverb.com
+
+# Storage Paths
+STORAGE_PATH=/var/www/video-compression/storage
+TEMP_PATH=/var/www/video-compression/storage/temp
+HLS_PATH=/var/www/video-compression/storage/hls
+
+# Worker Settings
+WORKER_INTERVAL=120000              # Poll every 2 minutes (120000ms)
+MAX_CONCURRENT_JOBS=1               # Process 1 video at a time
+RETRY_FAILED_AFTER=3600000          # Retry failed jobs after 1 hour
+
+# FFmpeg Settings
+FFMPEG_PATH=/usr/bin/ffmpeg
+SEGMENT_DURATION=10                 # 10-second segments
+HIGH_QUALITY_CRF=23                 # Lower = better quality
+MEDIUM_QUALITY_CRF=28
+LOW_QUALITY_CRF=32
+
+# Video Quality Settings
+HIGH_RESOLUTION=1080                # Max height in pixels
+MEDIUM_RESOLUTION=480
+LOW_RESOLUTION=360
+HIGH_BITRATE=5000k                  # Video bitrate
+MEDIUM_BITRATE=2500k
+LOW_BITRATE=1000k
+AUDIO_BITRATE=128k                  # Audio bitrate for all
+
+# Cleanup Settings
+AUTO_CLEANUP_ENABLED=true
+CLEANUP_TEMP_AFTER=3600000          # Delete temp files after 1 hour
+DELETE_OLD_VIDEOS_AFTER=90          # Delete videos older than 90 days
+
+# API Security
+API_KEY=your-secret-api-key         # For manual API calls
+RATE_LIMIT_WINDOW=900000            # 15 minutes
+RATE_LIMIT_MAX_REQUESTS=100         # Max requests per window
+
+# Monitoring
+ENABLE_LOGGING=true
+LOG_LEVEL=info                      # debug, info, warn, error
+SENTRY_DSN=                         # Optional error tracking
+
+# Admin Dashboard
+ADMIN_ENABLED=true
+ADMIN_PATH=/admin                   # URL path to dashboard
+```
+
+---
+
+## 🔄 WORKER SERVICE - MAIN LOOP
+
+### Worker Flow Diagram:
+
+```
+START
+  ↓
+Initialize Appwrite connection
+  ↓
+┌─────────────────────────────────────────┐
+│  MAIN LOOP (Every 2 minutes)            │
+│  ↓                                      │
+│  Check if already processing            │
+│  ├─ YES → Skip this cycle               │
+│  └─ NO → Continue                       │
+│      ↓                                  │
+│  Query Appwrite for pending jobs        │
+│  (status = 'pending', limit 1)          │
+│  ↓                                      │
+│  Found job?                             │
+│  ├─ NO → Log "No pending jobs", wait   │
+│  └─ YES → Process job                   │
+│      ↓                                  │
+│      Mark as processing                 │
+│      ↓                                  │
+│      Execute compression pipeline       │
+│      ↓                                  │
+│      Success?                           │
+│      ├─ YES → Mark completed            │
+│      └─ NO → Mark failed, log error     │
+│          ↓                              │
+│  Wait 2 minutes                         │
+│  ↓                                      │
+└─────────────────────────────────────────┘
+   Loop forever
+```
+
+### Worker States:
+
+| State | Description | Next Action |
+|-------|-------------|-------------|
+| **Idle** | Waiting for next cycle | Query Appwrite |
+| **Checking** | Querying for pending jobs | Process or wait |
+| **Processing** | Compressing video | Update status |
+| **Updating** | Writing results to Appwrite | Return to idle |
+| **Error** | Something failed | Log + mark failed |
+
+### Worker Query:
+
+**Finds jobs where:**
+- `compression_status = 'pending'`
+- `created_at` is oldest first (FIFO queue)
+- Limit 1 (process one at a time)
+
+**Sort order:** `created_at ASC` (oldest first)
+
+---
+
+## 🎬 COMPRESSION PIPELINE
+
+### Complete Pipeline Steps:
+
+```
+1. PRE-FLIGHT CHECKS
+   ↓
+   - Validate original_video_url exists
+   - Check URL is accessible (HEAD request)
+   - Verify file type (MP4, MOV, AVI, MKV)
+   - Estimate download size
+   ↓
+   Update: status='processing', step='downloading'
+
+2. DOWNLOAD ORIGINAL
+   ↓
+   - Stream download to temp folder
+   - Show progress in Appwrite (% complete)
+   - Validate downloaded file (not corrupted)
+   - Get video metadata (duration, resolution, codec)
+   ↓
+   Temp file: /storage/temp/{wp_post_id}_original.mp4
+
+3. CREATE OUTPUT DIRECTORY
+   ↓
+   - Create /storage/hls/{wp_post_id}/
+   - Create subdirs: high/, medium/, low/
+   ↓
+   Update: step='creating_poster'
+
+4. GENERATE POSTER IMAGE
+   ↓
+   - Extract frame at 10% of video duration
+   - Resize to 1280x720 (maintain aspect ratio)
+   - Save as poster.jpg
+   ↓
+   Output: /storage/hls/{wp_post_id}/poster.jpg
+
+5. COMPRESS HIGH QUALITY
+   ↓
+   - Target: 1080p or original (whichever is lower)
+   - CRF 23 (high quality)
+   - Create HLS segments (10 sec each)
+   - Generate playlist.m3u8
+   ↓
+   Update: step='compressing_high', progress=33%
+   Output: /storage/hls/{wp_post_id}/high/
+
+6. COMPRESS MEDIUM QUALITY
+   ↓
+   - Target: 480p
+   - CRF 28 (medium quality)
+   - Scale video down
+   - Create HLS segments
+   ↓
+   Update: step='compressing_medium', progress=66%
+   Output: /storage/hls/{wp_post_id}/medium/
+
+7. COMPRESS LOW QUALITY
+   ↓
+   - Target: 360p
+   - CRF 32 (lower quality, smaller file)
+   - Scale video down
+   - Create HLS segments
+   ↓
+   Update: step='compressing_low', progress=90%
+   Output: /storage/hls/{wp_post_id}/low/
+
+8. GENERATE MASTER PLAYLIST
+   ↓
+   - Create master.m3u8
+   - List all 3 quality variants
+   - Include bandwidth estimates
+   - Set resolution metadata
+   ↓
+   Update: step='finalizing', progress=95%
+   Output: /storage/hls/{wp_post_id}/master.m3u8
+
+9. UPDATE APPWRITE
+   ↓
+   - Set all HLS URLs
+   - Set poster URL
+   - Calculate total file size
+   - Set status='completed'
+   ↓
+   Update: step='completed', progress=100%
+
+10. CLEANUP
+    ↓
+    - Delete temp file
+    - Delete any partial files (on error)
+    - Log final stats
+    ↓
+    DONE
+```
+
+### Error Handling at Each Step:
+
+```
+Any step fails
+  ↓
+Update Appwrite:
+  - status = 'failed'
+  - error_message = detailed error
+  - failed_at_step = step name
+  ↓
+Cleanup temp files
+  ↓
+Log error with full stack trace
+  ↓
+Send notification (optional: email/Slack)
+  ↓
+Return to worker loop
+```
+
+---
+
+## 🎥 FFMPEG COMPRESSION DETAILS
+
+### High Quality Settings:
+
+**Target:** 1080p (or original if smaller)
+
+```
+Resolution: 1920x1080 (maintain aspect ratio)
+Video Codec: H.264 (libx264)
+CRF: 23 (visually lossless)
+Preset: fast (good compression/speed balance)
+Profile: high
+Audio Codec: AAC
+Audio Bitrate: 128k
+HLS Segment: 10 seconds
+Output: playlist.m3u8 + segment000.ts, segment001.ts...
+```
+
+**Why these settings?**
+- CRF 23: Best quality without being huge
+- Preset fast: Quick encoding, good compression
+- 10s segments: Good balance (not too many files, smooth seeking)
+
+### Medium Quality Settings:
+
+**Target:** 480p
+
+```
+Resolution: 854x480
+CRF: 28 (good quality, smaller file)
+Everything else same as high
+File size: ~50% of high quality
+```
+
+### Low Quality Settings:
+
+**Target:** 360p
+
+```
+Resolution: 640x360
+CRF: 32 (acceptable quality, smallest file)
+Everything else same
+File size: ~25% of high quality
+```
+
+### Poster Image Settings:
+
+```
+Extract: Frame at 10% duration
+Resolution: 1280x720 (max)
+Format: JPEG
+Quality: 85%
+```
+
+---
+
+## 📊 HLS OUTPUT STRUCTURE
+
+### Master Playlist (master.m3u8):
+
+**Purpose:** Tells player about available quality levels
+
+**Contains:**
+- Path to each quality playlist
+- Bandwidth estimate for each
+- Resolution metadata
+- Codec information
+
+**Player uses this to:**
+- Choose initial quality based on connection speed
+- Switch qualities during playback
+- Fallback if quality unavailable
+
+### Quality Playlists (playlist.m3u8):
+
+**Purpose:** Lists all segment files for that quality
+
+**Contains:**
+- Segment duration (10s)
+- Path to each .ts file
+- Type: VOD (video on demand, not live)
+
+### Segment Files (.ts):
+
+**What they are:**
+- Small chunks of video (10 seconds each)
+- Self-contained (can play independently)
+- MPEG-TS format (standard for HLS)
+
+**Why segments?**
+- Player only downloads what user watches
+- Quick seeking (jump to any segment)
+- Adaptive switching (change quality mid-video)
+- Efficient for mobile/slow connections
+
+### File Size Examples:
+
+**10-minute video:**
+
+```
+High Quality (1080p):
+- playlist.m3u8: ~2 KB
+- 60 segments x ~5 MB = ~300 MB total
+
+Medium Quality (480p):
+- 60 segments x ~2.5 MB = ~150 MB total
+
+Low Quality (360p):
+- 60 segments x ~1.2 MB = ~72 MB total
+
+Master playlist: ~1 KB
+Poster image: ~200 KB
+
+Total storage: ~522 MB for all qualities
+```
+
+---
+
+## 🌐 STATIC FILE SERVER
+
+### Purpose:
+Serve HLS files publicly so video players can access them
+
+### URL Structure:
+
+```
+Base: https://serverb.com/storage/hls/
+
+Example URLs:
+https://serverb.com/storage/hls/123/master.m3u8
+https://serverb.com/storage/hls/123/poster.jpg
+https://serverb.com/storage/hls/123/high/playlist.m3u8
+https://serverb.com/storage/hls/123/high/segment000.ts
+https://serverb.com/storage/hls/123/high/segment001.ts
+...
+```
+
+### HTTP Headers Needed:
+
+```
+Content-Type:
+  - .m3u8 → application/vnd.apple.mpegurl
+  - .ts → video/mp2t
+  - .jpg → image/jpeg
+
+Access-Control-Allow-Origin: * 
+  (Allow video players from other domains)
+
+Cache-Control:
+  - .m3u8 → max-age=3600 (1 hour)
+  - .ts → max-age=31536000 (1 year, immutable)
+  - .jpg → max-age=31536000 (1 year)
+```
+
+### Security Considerations:
+
+1. **Rate Limiting:**
+   - Max 100 requests per IP per minute
+   - Prevent bandwidth abuse
+
+2. **Hotlink Protection (Optional):**
+   - Check Referer header
+   - Only allow requests from your WordPress site
+
+3. **Signed URLs (Future):**
+   - Generate temporary tokens
+   - Expire after X hours
+   - Prevent unauthorized sharing
+
+4. **CDN Integration (Recommended):**
+   - Put Cloudflare/AWS CloudFront in front
+   - Cache files globally
+   - Reduce server load
+
+---
+
+## 🔌 REST API ENDPOINTS
+
+### 1. Health Check
+
+**Endpoint:** `GET /health`  
+**Auth:** None  
+**Purpose:** Monitor if service is running
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "uptime": 86400,
+  "version": "1.0.0",
+  "worker": {
+    "status": "idle",
+    "lastRun": "2025-10-22T10:30:00Z",
+    "jobsProcessed": 42
+  },
+  "storage": {
+    "available": "500 GB",
+    "used": "120 GB"
+  },
+  "appwrite": {
+    "connected": true,
+    "lastPing": "2025-10-22T10:29:55Z"
+  }
+}
+```
+
+### 2. Get Job Status
+
+**Endpoint:** `GET /api/post/:wp_post_id`  
+**Auth:** API Key (optional)  
+**Purpose:** Check compression status for specific post
+
+**Response:**
+```json
+{
+  "wp_post_id": 123,
+  "status": "processing",
+  "step": "compressing_high",
+  "progress": 45,
+  "created_at": "2025-10-22T10:20:00Z",
+  "started_at": "2025-10-22T10:21:00Z",
+  "estimated_completion": "2025-10-22T10:35:00Z",
+  "urls": null
+}
+```
+
+### 3. Manual Compression Trigger
+
+**Endpoint:** `POST /api/compress/:wp_post_id`  
+**Auth:** API Key (required)  
+**Purpose:** Force recompression or retry failed job
+
+**Request Body:**
+```json
+{
+  "priority": "high"  // Optional: skip queue
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Job queued for processing",
+  "wp_post_id": 123,
+  "position_in_queue": 3
+}
+```
+
+### 4. Get All Jobs
+
+**Endpoint:** `GET /api/jobs`  
+**Auth:** API Key (required)  
+**Purpose:** List all videos with filters
+
+**Query Parameters:**
+- `status` - Filter by status (pending/processing/completed/failed)
+- `limit` - Results per page (default: 20)
+- `offset` - Pagination offset
+- `sort` - Sort field (created_at, wp_post_id)
+- `order` - Sort order (asc, desc)
+
+**Response:**
+```json
+{
+  "total": 156,
+  "page": 1,
+  "jobs": [
+    {
+      "wp_post_id": 123,
+      "title": "My Video",
+      "status": "completed",
+      "created_at": "2025-10-22T10:00:00Z",
+      "completed_at": "2025-10-22T10:15:00Z",
+      "master_playlist_url": "/storage/hls/123/master.m3u8"
+    },
+    // ... more jobs
+  ]
+}
+```
+
+### 5. Delete Job
+
+**Endpoint:** `DELETE /api/post/:wp_post_id`  
+**Auth:** API Key (required)  
+**Purpose:** Delete HLS files and Appwrite document
+
+**Query Parameters:**
+- `delete_files` - true/false (default: true)
+
+**Response:**
+```json
+{
+  "success": true,
+  "deleted_files": true,
+  "space_freed": "523 MB"
+}
+```
+
+### 6. Get Statistics
+
+**Endpoint:** `GET /api/stats`  
+**Auth:** API Key (optional)  
+**Purpose:** System-wide statistics
+
+**Response:**
+```json
+{
+  "total_videos": 156,
+  "completed": 142,
+  "processing": 2,
+  "pending": 10,
+  "failed": 2,
+  "total_storage_used": "75 GB",
+  "average_compression_time": "8.5 minutes",
+  "videos_today": 12,
+  "success_rate": "98.7%"
+}
+```
+
+---
+
+## 🎛️ ADMIN DASHBOARD
+
+### Access:
+
+**URL:** `https://serverb.com/admin`  
+**Auth:** Appwrite Google OAuth  
+**Allowed Users:** Admin emails configured in Appwrite
+
+### Dashboard Layout:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  🎬 Video Compression Service                       │
+│  [Logout]                                           │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│  📊 STATISTICS                                      │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐│
+│  │ Total    │ │ Completed│ │Processing│ │ Failed ││
+│  │   156    │ │   142    │ │    2     │ │   2    ││
+│  └──────────┘ └──────────┘ └──────────┘ └────────┘│
+│                                                      │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐            │
+│  │ Storage  │ │ Today    │ │ Avg Time │            │
+│  │  75 GB   │ │   12     │ │ 8.5 min  │            │
+│  └──────────┘ └──────────┘ └──────────┘            │
+│                                                      │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│  🎥 ALL VIDEOS                                      │
+│  [Filters: All ▾] [Search: ________] [Refresh]     │
+│                                                      │
+│  ┌───┬────────────┬────────┬──────────┬─────────┐  │
+│  │📷 │ Title      │ Status │ Progress │ Actions │  │
+│  ├───┼────────────┼────────┼──────────┼─────────┤  │
+│  │🖼️ │ My Video   │✅ Done │ 100%     │🔗📊🗑️  │  │
+│  │🖼️ │ Tutorial   │⏳ Queue│ 0%       │🔄🗑️    │  │
+│  │🖼️ │ Demo       │⚙️ Proc │ 45%      │📊       │  │
+│  │🖼️ │ Failed Vid │❌ Error│ 0%       │🔄🗑️    │  │
+│  └───┴────────────┴────────┴──────────┴─────────┘  │
+│  [← Previous] [Page 1 of 8] [Next →]               │
+│                                                      │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│  📋 RECENT ACTIVITY                                 │
+│  • Video #156 completed - 2 min ago                │
+│  • Video #155 started processing - 5 min ago       │
+│  • Video #154 failed: Download timeout - 10 min ago│
+│  • Video #153 completed - 15 min ago               │
+│                                                      │
+├─────────────────────────────────────────────────────┤
+│                                                      │
+│  ⚙️ SYSTEM STATUS                                   │
+│  Worker: ✅ Running (idle)                          │
+│  Appwrite: ✅ Connected                             │
+│  Storage: ✅ 425 GB available                       │
+│  Last update: Just now                              │
+│                                                      │
+└─────────────────────────────────────────────────────┘
+```
+
+### Dashboard Features:
+
+#### 1. Real-time Updates
+- Auto-refresh every 10 seconds
+- WebSocket connection for live progress (optional)
+- Visual progress bars for processing videos
+
+#### 2. Filters & Search
+- Filter by status (all/pending/processing/completed/failed)
+- Search by title or post ID
+- Date range picker
+- Sort by: date, status, title
+
+#### 3. Actions per Video
+- **View Details:** Modal with full info, logs, URLs
+- **Play Video:** Preview in dashboard
+- **Retry:** Requeue failed jobs
+- **Delete:** Remove files and database entry
+- **Copy URLs:** Quick copy HLS URLs
+- **Download:** Get original or compressed files
+
+#### 4. Bulk Actions
+- Select multiple videos
+- Bulk delete
+- Bulk retry
+- Export list as CSV
+
+#### 5. System Controls
+- **Pause Worker:** Stop processing new jobs
+- **Resume Worker:** Restart processing
+- **Clear Queue:** Cancel all pending jobs
+- **Run Cleanup:** Delete old temp files
+
+---
+
+## 🔐 AUTHENTICATION & SECURITY
+
+### Admin Dashboard Auth:
+
+**Method:** Appwrite OAuth (Google)
+
+**Flow:**
+1. User clicks "Login with Google"
+2. Redirects to Appwrite OAuth
+3. Google sign-in
+4. Appwrite validates + creates session
+5. Returns to dashboard with session token
+6. Check if email is in allowed list
+7. Grant/deny access
+
+**Allowed Users:**
+- Stored in Appwrite (team/collection)
+- Only admins can add new users
+- Session expires after 24 hours
+
+### API Authentication:
+
+**Method:** API Key in header
+
+**Request:**
+```
+POST /api/compress/123
+Authorization: Bearer your-api-key-here
+```
+
+**Validation:**
+1. Check if API key header exists
+2. Compare with stored API key (hashed)
+3. Grant/deny access
+
+**Security:**
+- Generate random API key (64 chars)
+- Store hashed version only
+- Rotate keys periodically
+- Log all API usage
+
+### Rate Limiting:
+
+**Limits:**
+- Dashboard: 1000 requests/hour per IP
+- API (authenticated): 100 requests/15 min
+- Static files: 100 requests/minute per IP
+
+**Exceeded:**
+- Return 429 Too Many Requests
+- Include Retry-After header
+- Log abuse attempts
+
+---
+
+## 📝 LOGGING SYSTEM
+
+### Log Files:
+
+| File | What it logs | Rotation |
+|------|--------------|----------|
+| **worker.log** | Worker activity (checks, jobs started/finished) | Daily |
+| **compression.log** | FFmpeg output, compression details | Daily |
+| **error.log** | All errors with stack traces | Daily |
+| **access.log** | HTTP requests (API + static files) | Daily |
+| **audit.log** | Admin actions (delete, retry, etc.) | Weekly |
+
+### Log Levels:
+
+```
+DEBUG → Verbose details (development only)
+INFO  → Normal operations
+WARN  → Something unusual (slow download, high CPU)
+ERROR → Failed operation (needs attention)
+FATAL → Critical error (worker crash)
+```
+
+### Log Format:
+
+```
+[2025-10-22 10:30:45] [INFO] [Worker] Checking for pending jobs
+[2025-10-22 10:30:46] [INFO] [Worker] Found job: wp_post_id=123
+[2025-10-22 10:30:46] [INFO] [Downloader] Starting download: https://...
+[2025-10-22 10:31:12] [INFO] [Downloader] Download complete: 125 MB
+[2025-10-22 10:31:13] [INFO] [Compressor] Starting high quality compression
+[2025-10-22 10:35:45] [INFO] [Compressor] High quality complete
+[2025-10-22 10:35:46] [INFO] [Compressor] Starting medium quality compression
+...
+[2025-10-22 10:42:30] [INFO] [AppwriteSync] Job completed: wp_post_id=123
+[2025-10-22 10:42:31] [INFO] [Cleanup] Deleted temp file
+```
+
+### Error Log Example:
+
+```
+[2025-10-22 10:30:45] [ERROR] [Downloader] Download failed: wp_post_id=124
+  URL: https://example.com/video.mp4
+  Error: ENOTFOUND (DNS lookup failed)
+  Stack:
+    at Downloader.download (/app/services/downloader.js:45)
+    at Worker.processJob (/app/services/worker.js:78)
+  Retry scheduled: 2025-10-22 11:30:45
+```
+
+### Log Rotation:
+
+- Daily logs: Keep 30 days
+- Weekly logs: Keep 12 weeks
+- Old logs: Archive to S3/storage (optional)
+- Compressed with gzip
+
+---
+
+## 🧹 CLEANUP & MAINTENANCE
+
+### Automatic Cleanup:
+
+#### 1. Temp Files Cleanup
+**When:** Every hour  
+**What:** Delete files in `/storage/temp/` older than 1 hour  
+**Why:** Failed downloads leave files behind
+
+#### 2. Old Video Cleanup (Optional)
+**When:** Daily at 3 AM  
+**What:** Delete videos older than 90 days  
+**Process:**
+1. Query Appwrite for old videos
+2. Check last access date (if tracking enabled)
+3. Delete HLS folder
+4. Update Appwrite (mark as deleted, don't remove doc)
+5. Log space freed
+
+#### 3. Failed Jobs Cleanup
+**When:** Every 6 hours  
+**What:** Reset jobs stuck in "processing" for > 2 hours  
+**Why:** Worker crash might leave orphaned jobs  
+**Action:** Mark as "failed" with error "Processing timeout"
+
+### Manual Maintenance Scripts:
+
+#### 1. Rebuild Master Playlists
+**Use case:** FFmpeg version changed, need to update metadata  
+**What:** Regenerate all master.m3u8 files without recompressing
+
+#### 2. Verify Integrity
+**Use case:** Check for corrupted files  
+**What:** Test play each video, report broken ones
+
+#### 3. Migrate Storage
+**Use case:** Moving to new server/CDN  
+**What:** Copy all HLS files, update URLs in Appwrite
+
+#### 4. Recompress All
+**Use case:** Better codec available, quality settings changed  
+**What:** Mark all as pending, let worker reprocess
+
+---
+
+## 📊 MONITORING & ALERTS
+
+### Health Checks:
+
+**What to monitor:**
+1. **Worker Status**
+   - Is it running?
+   - Last successful job time
+   - Jobs stuck in processing
+
+2. **Disk Space**
+   - Storage usage %
+   - Alert at 80% full
+   - Critical at 90%
+
+3. **Appwrite Connection**
+   - Can connect?
+   - Response time
+   - Error rate
+
+4. **FFmpeg Availability**
+   - Is FFmpeg installed?
+   - Correct version?
+   - Can execute test command?
+
+### Alert Triggers:
+
+| Condition | Alert Level | Action |
+|-----------|-------------|--------|
+| Worker down > 5 min | CRITICAL | Email + SMS |
+| Disk > 90% full | CRITICAL | Email |
+| Failed jobs > 10 | WARNING | Email |
+| Appwrite timeout | WARNING | Retry + log |
+| FFmpeg error | ERROR | Skip job + notify |
+
+### Monitoring Integrations:
+
+**Options:**
+- **Sentry:** Error tracking
+- **Datadog:** System metrics
+- **UptimeRobot:** Uptime monitoring
+- **PagerDuty:** On-call alerts
+- **Slack/Discord:** Notifications
+
+---
+
+## 🚀 DEPLOYMENT PLAN
+
+### Server Requirements:
+
+**Minimum:**
+- CPU: 4 cores (8 recommended for faster compression)
+- RAM: 8 GB (16 GB recommended)
+- Storage: 500 GB SSD (or more depending on video volume)
+- OS: Ubuntu 20.04+ / Debian 11+
+- Network: 1 Gbps connection
+
+**Software:**
+- Node.js 18+ LTS
+- FFmpeg 5.0+ (with libx264, AAC support)
+- PM2 (process manager)
+- Nginx (reverse proxy + static files)
+
+### Installation Steps:
+
+1. **Provision Server**
+   - Create VPS/dedicated server
+   - Set up firewall (allow 80, 443, SSH)
+   - Create non-root user
+
+2. **Install Dependencies**
+   - Update system packages
+   - Install Node.js (via nvm)

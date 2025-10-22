@@ -1,0 +1,908 @@
+Install FFmpeg (compile from source for latest version)
+   - Install PM2 globally
+   - Install Nginx
+
+3. **Clone & Configure**
+   - Clone repository to `/var/www/video-compression/`
+   - Copy `.env.example` to `.env`
+   - Fill in all environment variables
+   - Run `npm install`
+
+4. **Create Directory Structure**
+   - Create `/var/www/video-compression/storage/temp/`
+   - Create `/var/www/video-compression/storage/hls/`
+   - Create `/var/www/video-compression/logs/`
+   - Set correct permissions (775, www-data group)
+
+5. **Configure Nginx**
+   - Set up reverse proxy for API (port 3000)
+   - Serve static files from `/storage/hls/`
+   - Enable gzip compression for .m3u8 files
+   - Set correct MIME types
+   - Configure SSL certificate (Let's Encrypt)
+
+6. **Start Application**
+   - Test: `node server.js` (check for errors)
+   - Production: `pm2 start server.js --name video-compressor`
+   - Enable PM2 startup: `pm2 startup` + `pm2 save`
+
+7. **Test Full Pipeline**
+   - Manually create Appwrite document (status=pending)
+   - Watch worker logs: `pm2 logs video-compressor`
+   - Verify files created in storage
+   - Check Appwrite updated with URLs
+   - Test playback via browser
+
+### Nginx Configuration Example:
+
+```
+server {
+    listen 80;
+    server_name serverb.com;
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name serverb.com;
+
+    ssl_certificate /etc/letsencrypt/live/serverb.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/serverb.com/privkey.pem;
+
+    # API endpoints
+    location /api/ {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    # Admin dashboard
+    location /admin {
+        proxy_pass http://localhost:3000/admin;
+    }
+
+    # Health check
+    location /health {
+        proxy_pass http://localhost:3000/health;
+    }
+
+    # Static HLS files
+    location /storage/hls/ {
+        alias /var/www/video-compression/storage/hls/;
+        
+        # CORS headers for video players
+        add_header Access-Control-Allow-Origin *;
+        add_header Access-Control-Allow-Methods 'GET, OPTIONS';
+        
+        # Cache headers
+        location ~* \.m3u8$ {
+            add_header Cache-Control "max-age=3600";
+            add_header Content-Type application/vnd.apple.mpegurl;
+        }
+        
+        location ~* \.ts$ {
+            add_header Cache-Control "max-age=31536000, immutable";
+            add_header Content-Type video/mp2t;
+        }
+        
+        location ~* \.(jpg|jpeg)$ {
+            add_header Cache-Control "max-age=31536000";
+        }
+    }
+
+    # Deny access to temp folder
+    location /storage/temp/ {
+        deny all;
+        return 403;
+    }
+}
+```
+
+### PM2 Configuration:
+
+**ecosystem.config.js:**
+```
+module.exports = {
+  apps: [{
+    name: 'video-compressor',
+    script: 'server.js',
+    instances: 1,
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '2G',
+    env: {
+      NODE_ENV: 'production'
+    },
+    error_file: './logs/pm2-error.log',
+    out_file: './logs/pm2-out.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
+  }]
+};
+```
+
+**PM2 Commands:**
+- Start: `pm2 start ecosystem.config.js`
+- Stop: `pm2 stop video-compressor`
+- Restart: `pm2 restart video-compressor`
+- Logs: `pm2 logs video-compressor`
+- Monitor: `pm2 monit`
+
+---
+
+## 🔄 WORKER IMPLEMENTATION DETAILS
+
+### Worker State Management:
+
+**States:**
+```
+INITIALIZING → Worker starting up
+IDLE         → Waiting for jobs
+CHECKING     → Querying Appwrite
+PROCESSING   → Compressing video
+UPDATING     → Writing results
+ERROR        → Something failed
+SHUTDOWN     → Graceful shutdown
+```
+
+### Concurrency Control:
+
+**Single Job Processing (Recommended):**
+- Process one video at a time
+- Prevents CPU/memory overload
+- Simpler error handling
+- More predictable completion times
+
+**Multiple Jobs (Advanced):**
+- Process 2-3 videos simultaneously
+- Requires more resources (8+ CPU cores, 16GB+ RAM)
+- Complex queue management
+- Risk of resource exhaustion
+
+**Implementation:**
+```
+Global variable: isProcessing = false
+
+Worker loop:
+  If isProcessing:
+    Skip this cycle
+  Else:
+    Query for pending job
+    If found:
+      isProcessing = true
+      Process job
+      isProcessing = false
+```
+
+### Queue Priority System (Optional):
+
+**Priority Levels:**
+1. **URGENT** (priority: 1)
+   - Manually triggered retries
+   - Admin-requested compressions
+   
+2. **NORMAL** (priority: 5)
+   - Regular post saves
+   - Default priority
+   
+3. **LOW** (priority: 10)
+   - Bulk recompressions
+   - Background migrations
+
+**Query with priority:**
+```
+Get documents WHERE:
+  - status = 'pending'
+ORDER BY:
+  - priority ASC (urgent first)
+  - created_at ASC (oldest first)
+LIMIT: 1
+```
+
+### Error Retry Logic:
+
+**Retry Strategy:**
+```
+Attempt 1: Immediate (within 2 min)
+Attempt 2: After 1 hour
+Attempt 3: After 6 hours
+Failed permanently: After 3 attempts
+```
+
+**What to retry:**
+- Network errors (ECONNRESET, ETIMEDOUT)
+- Temporary FFmpeg errors
+- Appwrite connection issues
+
+**What NOT to retry:**
+- Invalid video format
+- Corrupted source file
+- Insufficient disk space
+- Invalid URL (404)
+
+**Tracking retries:**
+```
+Add field to Appwrite document:
+  - retry_count: integer (0-3)
+  - last_retry_at: timestamp
+  - retry_errors: array of error messages
+```
+
+---
+
+## 💾 STORAGE MANAGEMENT
+
+### Storage Structure Details:
+
+**Per-video storage breakdown:**
+```
+/storage/hls/123/
+├── poster.jpg           (~200 KB)
+├── master.m3u8          (~1 KB)
+├── high/
+│   ├── playlist.m3u8    (~2 KB)
+│   └── segment*.ts      (~5 MB each)
+├── medium/
+│   ├── playlist.m3u8    (~2 KB)
+│   └── segment*.ts      (~2.5 MB each)
+└── low/
+    ├── playlist.m3u8    (~2 KB)
+    └── segment*.ts      (~1.2 MB each)
+
+10-minute video = ~60 segments per quality
+Total: ~520 MB per video (all qualities)
+```
+
+### Storage Scaling:
+
+**100 videos:**
+- 520 MB × 100 = 52 GB
+- Add 20% overhead = 62 GB needed
+
+**1,000 videos:**
+- 520 MB × 1000 = 520 GB
+- Recommend: 1 TB storage
+
+**10,000 videos:**
+- 5.2 TB
+- Consider: CDN + object storage (S3, Backblaze)
+
+### Storage Optimization:
+
+#### 1. CDN Integration
+**When:** > 500 videos or high traffic
+**How:**
+- Upload HLS files to S3/Backblaze
+- Set up CloudFlare/CloudFront
+- Update Appwrite URLs to CDN paths
+- Keep local copies for 7 days (cache)
+
+#### 2. Selective Quality
+**When:** Storage limited
+**Options:**
+- Only create high + low (skip medium)
+- Dynamic: Create medium only if requested
+- User preference: Let uploader choose qualities
+
+#### 3. Compression Optimization
+**Trade-offs:**
+- Lower CRF = bigger files, better quality
+- Higher CRF = smaller files, worse quality
+- Current settings (23/28/32) are balanced
+
+#### 4. Segment Duration
+**Current:** 10 seconds
+**Shorter (6s):** More files, smoother quality switching, slower seeks
+**Longer (15s):** Fewer files, faster seeks, chunkier switching
+
+---
+
+## 🎯 PERFORMANCE OPTIMIZATION
+
+### FFmpeg Optimization:
+
+#### 1. Preset Selection
+**Current:** `-preset fast`
+
+**Options:**
+- `ultrafast` → 10x faster, 2x bigger files
+- `fast` → Good balance (recommended)
+- `medium` → Default, slower
+- `slow` → Better compression, much slower
+- `veryslow` → Best compression, extremely slow
+
+**Recommendation:** Use `fast` for production, `medium` for archival
+
+#### 2. Hardware Acceleration
+**NVIDIA GPU (NVENC):**
+```
+-c:v h264_nvenc
+-preset p4
+-cq 23
+```
+**Benefits:** 5-10x faster compression
+**Requirements:** GPU with NVENC support
+
+**Intel Quick Sync:**
+```
+-c:v h264_qsv
+-preset medium
+-global_quality 23
+```
+
+#### 3. Multi-threading
+**FFmpeg threads:**
+```
+-threads 4    (use 4 CPU cores)
+-threads 0    (auto-detect, use all)
+```
+
+**Current setup:** Auto-detect (threads 0)
+
+#### 4. Two-pass Encoding (Optional)
+**For best quality:**
+```
+Pass 1: Analyze video
+Pass 2: Encode with optimal bitrate
+```
+**Trade-off:** 2x compression time, 5-10% better quality
+
+### Node.js Optimization:
+
+#### 1. Worker Optimization
+**Current:** Single process
+**Advanced:** Cluster mode (multiple workers)
+```
+PM2: instances: 'max'
+Result: One worker per CPU core
+```
+
+#### 2. Memory Management
+**Garbage collection:**
+```
+--max-old-space-size=4096  (4GB heap)
+--expose-gc                (manual GC)
+```
+
+#### 3. Streaming Downloads
+**Current:** Stream to disk
+**Don't:** Load entire video into RAM
+
+---
+
+## 📈 SCALING STRATEGIES
+
+### Horizontal Scaling:
+
+**When:** Single server can't keep up
+
+**Architecture:**
+```
+                    ┌──────────────┐
+                    │   Appwrite   │
+                    │   (Queue)    │
+                    └──────┬───────┘
+                           │
+            ┌──────────────┼──────────────┐
+            │              │              │
+      ┌─────▼────┐   ┌────▼─────┐   ┌───▼──────┐
+      │ Worker 1 │   │ Worker 2 │   │ Worker 3 │
+      │ Server A │   │ Server B │   │ Server C │
+      └──────────┘   └──────────┘   └──────────┘
+            │              │              │
+            └──────────────┼──────────────┘
+                           │
+                    ┌──────▼───────┐
+                    │ Shared       │
+                    │ Storage      │
+                    │ (NFS/S3)     │
+                    └──────────────┘
+```
+
+**Implementation:**
+1. Each server runs same worker code
+2. All query same Appwrite collection
+3. Use Appwrite's built-in locking (atomic updates)
+4. Share storage via NFS or S3
+5. Load balancer for API/static files
+
+### Vertical Scaling:
+
+**When:** Single server, need more power
+
+**Upgrades:**
+- CPU: 4 → 8 → 16 cores
+- RAM: 8 → 16 → 32 GB
+- Storage: HDD → SSD → NVMe
+- Network: 1 Gbps → 10 Gbps
+
+### Queue Optimization:
+
+**Advanced queue system:**
+- Use Redis for job queue (instead of Appwrite polling)
+- Implement job priorities
+- Add job scheduling (process at specific times)
+- Support job dependencies (wait for other jobs)
+
+---
+
+## 🧪 TESTING STRATEGY
+
+### Unit Tests:
+
+**Test each module:**
+1. **Downloader**
+   - Valid URL → Success
+   - Invalid URL → Error
+   - Timeout → Retry
+   - Large file → Progress tracking
+
+2. **Compressor**
+   - Valid video → HLS output
+   - Invalid format → Error
+   - Corrupted file → Error
+   - Different resolutions → Correct scaling
+
+3. **Storage**
+   - Create directory → Success
+   - Write file → Success
+   - Delete file → Success
+   - Check space → Correct amount
+
+4. **Appwrite Sync**
+   - Create document → Success
+   - Update document → Success
+   - Query documents → Correct results
+   - Connection error → Retry
+
+### Integration Tests:
+
+**End-to-end flow:**
+1. Create test document in Appwrite (status=pending)
+2. Worker picks up job
+3. Download test video (use small sample file)
+4. Compress to HLS
+5. Verify output files exist
+6. Verify Appwrite updated
+7. Test playback via HLS.js
+8. Cleanup test files
+
+### Load Tests:
+
+**Simulate heavy usage:**
+1. Create 100 pending jobs
+2. Monitor worker performance
+3. Check completion time
+4. Monitor CPU/RAM/disk usage
+5. Verify no errors
+
+**Stress test:**
+- Create 1000 pending jobs
+- Run multiple workers
+- Monitor system stability
+- Check for race conditions
+
+### Test Data:
+
+**Sample videos needed:**
+- Short (30 sec) - MP4, 1080p
+- Medium (5 min) - MP4, 720p
+- Long (30 min) - MP4, 1080p
+- Different codec (H.265)
+- Different format (MOV, AVI)
+- Corrupted file
+- Very large (5GB+)
+- Odd resolution (1366x768)
+
+---
+
+## 🐛 TROUBLESHOOTING GUIDE
+
+### Common Issues:
+
+#### 1. Worker Not Processing Jobs
+
+**Symptoms:** Jobs stuck in pending status
+
+**Checks:**
+- Is worker running? `pm2 status`
+- Check worker logs: `pm2 logs video-compressor`
+- Can connect to Appwrite? Test connection
+- Is `isProcessing` stuck as true? Restart worker
+
+**Solutions:**
+- Restart worker: `pm2 restart video-compressor`
+- Check Appwrite credentials
+- Verify network connectivity
+
+#### 2. FFmpeg Errors
+
+**Symptoms:** Jobs fail during compression
+
+**Common errors:**
+- `Cannot find codec libx264` → FFmpeg not compiled with x264
+- `Permission denied` → File/directory permissions
+- `No such file or directory` → Input file missing
+
+**Solutions:**
+- Reinstall FFmpeg with all codecs
+- Fix permissions: `chown -R www-data:www-data /storage/`
+- Verify download completed before compression
+
+#### 3. Disk Space Full
+
+**Symptoms:** Worker crashes, files not saving
+
+**Check:** `df -h`
+
+**Solutions:**
+- Delete old temp files: `rm -rf /storage/temp/*`
+- Run cleanup script
+- Enable auto-cleanup
+- Add more storage
+
+#### 4. Slow Compression
+
+**Symptoms:** Videos take hours to compress
+
+**Causes:**
+- Slow CPU
+- Wrong FFmpeg preset
+- Large input file
+- Network bottleneck (downloading)
+
+**Solutions:**
+- Use faster preset (`-preset ultrafast`)
+- Enable hardware acceleration (NVENC)
+- Upgrade server CPU
+- Use lower quality settings
+
+#### 5. Appwrite Connection Errors
+
+**Symptoms:** Cannot read/write documents
+
+**Checks:**
+- Is Appwrite server running?
+- Are credentials correct?
+- Is API key valid and has permissions?
+- Network firewall blocking?
+
+**Solutions:**
+- Test endpoint: `curl https://appwrite.yourserver.com/v1/health`
+- Regenerate API key
+- Check firewall rules
+
+#### 6. Videos Won't Play
+
+**Symptoms:** HLS player shows error
+
+**Checks:**
+- Do files exist on disk?
+- Are URLs correct in Appwrite?
+- CORS headers set correctly?
+- MIME types configured?
+
+**Solutions:**
+- Verify file paths match URLs
+- Check Nginx configuration
+- Test direct URL in browser
+- Check browser console for errors
+
+---
+
+## 📊 MONITORING DASHBOARD DETAILS
+
+### Real-time Metrics:
+
+**Display every 10 seconds:**
+```
+┌─ System Resources ─────────────────────┐
+│ CPU Usage:     [████████░░] 82%        │
+│ Memory:        [██████░░░░] 6.2 / 16 GB│
+│ Disk:          [████░░░░░░] 120 / 500GB│
+│ Network In:    15 Mbps                 │
+│ Network Out:   45 Mbps                 │
+└────────────────────────────────────────┘
+
+┌─ Worker Status ────────────────────────┐
+│ Status:        Processing              │
+│ Current Job:   wp_post_id=156          │
+│ Progress:      45% (Compressing high)  │
+│ Queue Length:  12 pending jobs         │
+│ Uptime:        14 days, 6 hours        │
+│ Jobs Today:    42 completed            │
+└────────────────────────────────────────┘
+
+┌─ Performance Metrics ──────────────────┐
+│ Avg Compression Time:  8.5 minutes     │
+│ Success Rate:          98.7%           │
+│ Failed Today:          1               │
+│ Storage Used Today:    22 GB           │
+└────────────────────────────────────────┘
+```
+
+### Alert Conditions:
+
+**Warning Level (Yellow):**
+- CPU > 90% for 5+ minutes
+- Memory > 80%
+- Disk > 80%
+- Failed jobs > 5 in last hour
+- Worker loop delayed > 5 minutes
+
+**Critical Level (Red):**
+- CPU sustained 100%
+- Memory > 95%
+- Disk > 95%
+- Worker crashed
+- Appwrite disconnected
+
+### Notification System:
+
+**Channels:**
+1. **Email:** Critical alerts only
+2. **Slack/Discord:** All alerts + daily summary
+3. **Dashboard:** Real-time visual indicators
+4. **SMS:** Critical alerts (optional, costs $)
+
+**Daily Report:**
+```
+📊 Video Compression Daily Report - Oct 22, 2025
+
+✅ Successfully Processed: 42 videos
+❌ Failed: 1 video
+⏳ Pending: 12 videos
+📦 Storage Used: 22 GB
+⏱️ Avg Processing Time: 8.5 minutes
+🏆 Success Rate: 97.6%
+
+Top Error: Download timeout (1 occurrence)
+
+System Health: ✅ All systems operational
+```
+
+---
+
+## 🔄 BACKUP & DISASTER RECOVERY
+
+### What to Backup:
+
+1. **Appwrite Database**
+   - Full database dump daily
+   - Incremental every 6 hours
+   - Store offsite (S3, Backblaze)
+
+2. **HLS Files** (Optional)
+   - Not critical (can regenerate)
+   - If backing up: Sync to S3/Glacier
+   - Keep 30 days of backups
+
+3. **Configuration**
+   - `.env` file (encrypted)
+   - Nginx configs
+   - PM2 ecosystem file
+
+4. **Logs**
+   - Archive logs monthly
+   - Keep 12 months
+   - Compress with gzip
+
+### Disaster Recovery Plan:
+
+**Scenario 1: Server Crash**
+1. Provision new server
+2. Install dependencies
+3. Restore configuration from backup
+4. Appwrite already has job data
+5. Start worker
+6. Jobs resume automatically
+
+**Scenario 2: Storage Lost**
+1. HLS files gone but Appwrite intact
+2. Mark all jobs as pending (bulk update)
+3. Worker reprocesses all videos
+4. Takes time but fully recoverable
+
+**Scenario 3: Appwrite Data Lost**
+1. Most critical scenario
+2. Need database backup
+3. Restore from latest backup
+4. Some recent jobs may be lost
+5. WordPress plugin can resync
+
+### Recovery Time Objectives:
+
+- **RTO (Recovery Time):** 4 hours
+- **RPO (Recovery Point):** 6 hours (max data loss)
+
+---
+
+## 🚦 DEPLOYMENT CHECKLIST
+
+### Pre-deployment:
+
+- [ ] Server provisioned with correct specs
+- [ ] Domain/subdomain configured (serverb.com)
+- [ ] SSL certificate installed
+- [ ] Firewall configured (ports 80, 443 open)
+- [ ] Appwrite instance accessible
+- [ ] API keys generated with correct permissions
+
+### Installation:
+
+- [ ] Node.js installed (v18+)
+- [ ] FFmpeg compiled with x264, AAC
+- [ ] PM2 installed globally
+- [ ] Nginx installed and configured
+- [ ] Storage directories created with correct permissions
+- [ ] Application code deployed
+- [ ] Dependencies installed (`npm install`)
+- [ ] `.env` configured with all values
+
+### Testing:
+
+- [ ] Health endpoint responds: `GET /health`
+- [ ] Appwrite connection successful
+- [ ] FFmpeg runs: `ffmpeg -version`
+- [ ] Can write to storage directories
+- [ ] Nginx serves static files
+- [ ] Admin dashboard loads
+- [ ] API authentication works
+
+### Production:
+
+- [ ] Worker starts successfully
+- [ ] PM2 configured to start on boot
+- [ ] Logs rotating correctly
+- [ ] Monitoring configured
+- [ ] Backup system active
+- [ ] Test end-to-end with real video
+- [ ] Verify WordPress plugin can access HLS files
+
+### Post-deployment:
+
+- [ ] Monitor logs for 24 hours
+- [ ] Process 10+ videos successfully
+- [ ] Check system resources (CPU, RAM, disk)
+- [ ] Verify no memory leaks
+- [ ] Test admin dashboard features
+- [ ] Document any issues/gotchas
+
+---
+
+## 📚 MAINTENANCE PROCEDURES
+
+### Daily:
+
+- Check worker status (automated)
+- Review error logs for new issues
+- Monitor disk space
+- Verify backups completed
+
+### Weekly:
+
+- Review failed jobs, retry if needed
+- Check compression success rate
+- Analyze performance metrics
+- Update any outdated dependencies
+
+### Monthly:
+
+- Archive old logs
+- Review and optimize storage usage
+- Check for FFmpeg updates
+- Test disaster recovery process
+- Review monitoring alerts (false positives?)
+
+### Quarterly:
+
+- Review and update documentation
+- Audit API key usage
+- Performance optimization review
+- Capacity planning (storage, CPU)
+
+---
+
+## 🎯 SUCCESS METRICS
+
+### Key Performance Indicators:
+
+**Operational:**
+- Success Rate: > 95%
+- Avg Compression Time: < 10 minutes
+- Worker Uptime: > 99%
+- Queue Wait Time: < 5 minutes
+
+**Technical:**
+- API Response Time: < 200ms
+- HLS Playback Success: > 99%
+- Storage Efficiency: < 600 MB per video
+- Error Rate: < 2%
+
+**Business:**
+- Videos Processed: Track daily/monthly
+- Storage Costs: $ per GB
+- Server Costs: $ per month
+- Cost per Video: Total costs / videos processed
+
+### Reporting:
+
+**Weekly Report:**
+- Videos processed
+- Success/failure breakdown
+- Top errors
+- System health summary
+
+**Monthly Report:**
+- Trend analysis (processing increasing?)
+- Cost breakdown
+- Performance improvements
+- Capacity forecast
+
+---
+
+## 🔮 FUTURE ENHANCEMENTS
+
+### Phase 2 Features:
+
+1. **Smart Quality Selection**
+   - Analyze source video
+   - Skip high quality if source is 480p
+   - Adaptive quality based on content type
+
+2. **Video Analytics**
+   - Track plays, completion rate
+   - Heatmaps (where users skip)
+   - Integration with Google Analytics
+
+3. **Advanced Scheduling**
+   - Process videos at specific times (off-peak)
+   - Priority queue for premium users
+   - Bandwidth throttling
+
+4. **Content Delivery Network**
+   - Auto-upload to CDN after compression
+   - Multi-region replication
+   - Intelligent routing
+
+5. **AI Features**
+   - Auto-generate thumbnails (best frame selection)
+   - Scene detection for chapter markers
+   - Auto-transcription/captions
+   - Content moderation
+
+### Phase 3 Features:
+
+1. **Live Streaming**
+   - Support HLS live streams
+   - DVR functionality
+   - Multi-bitrate live encoding
+
+2. **DRM Protection**
+   - Encrypt HLS segments
+   - License key management
+   - Prevent unauthorized downloads
+
+3. **Advanced Editor**
+   - Trim videos before compression
+   - Add watermarks
+   - Combine multiple clips
+
+4. **White Label**
+   - Rebrand admin dashboard
+   - Custom domain per client
+   - Multi-tenant architecture
+
+---
+
+**That's the complete compression site plan! Ready to start building when you are.** 🚀
+
+**Key Takeaways:**
+- Worker polls Appwrite every 2 minutes
+- Downloads → FFmpeg creates 3 HLS qualities → Updates Appwrite
+- Nginx serves static HLS files publicly
+- Admin dashboard for monitoring
+- Fully automated with error handling and retry logic
+- Scalable architecture for growth
