@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Compression Queue - Admin Dashboard</title>
+    <link rel="stylesheet" href="css/admin.css">
+    <script src="https://cdn.jsdelivr.net/npm/appwrite@13.0.0"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Video Compression Service</h1>
+            <p class="subtitle">Real-time queue monitoring and management</p>
+        </header>
+
+        <div class="stats-grid">
+            <div class="stat-card pending">
+                <div class="stat-number" id="stat-pending">0</div>
+                <div class="stat-label">Pending</div>
+            </div>
+            <div class="stat-card processing">
+                <div class="stat-number" id="stat-processing">0</div>
+                <div class="stat-label">Processing</div>
+            </div>
+            <div class="stat-card completed">
+                <div class="stat-number" id="stat-completed">0</div>
+                <div class="stat-label">Completed</div>
+            </div>
+            <div class="stat-card failed">
+                <div class="stat-number" id="stat-failed">0</div>
+                <div class="stat-label">Failed</div>
+            </div>
+        </div>
+
+        <div class="filters">
+            <label>
+                Filter by status:
+                <select id="status-filter">
+                    <option value="all">All</option>
+                    <option value="pending">Pending</option>
+                    <option value="processing">Processing</option>
+                    <option value="completed">Completed</option>
+                    <option value="failed">Failed</option>
+                </select>
+            </label>
+            <button onclick="refreshData()" class="btn-refresh">Refresh</button>
+        </div>
+
+        <div class="jobs-container">
+            <h2>Compression Queue</h2>
+            <div id="jobs-list">
+                <p class="loading">Loading jobs...</p>
+            </div>
+        </div>
+
+        <div class="config-panel">
+            <h3>Configuration</h3>
+            <div class="config-info">
+                <p><strong>Appwrite Endpoint:</strong> <span id="config-endpoint">Not configured</span></p>
+                <p><strong>Worker Interval:</strong> <span id="config-interval">2 minutes</span></p>
+                <p><strong>Auto-refresh:</strong> <span id="auto-refresh-status">Enabled</span></p>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/admin.js"></script>
+</body>
+</html>
